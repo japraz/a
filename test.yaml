@@ -1,34 +1,130 @@
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
+---
+apiVersion: v1
+kind: ConfigMap
 metadata:
-  name: argo-events-eventbus-policy
-  namespace: argo-events
+  name: stan-config
+data:
+  stan.conf: |
+    port: 4222
+    http: 8222
+
+    cluster {
+      port: 6222
+      routes: $CLUSTER_ROUTES
+    }
+    debug: true
+
+    streaming {
+     id: stan
+     store: file
+     dir: /data/stan/store
+     cluster {
+       node_id: $POD_NAME
+       log_path: /data/stan/log
+       # Explicit names of resulting peers
+       peers: ["stan-0", "stan-1", "stan-2"]
+      }
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stan
+  labels:
+    app: stan
 spec:
-  podSelector:
+  selector:
+    app: stan
+  clusterIP: None
+  ports:
+  - name: metrics
+    port: 7777
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: stan
+  labels:
+    app: stan
+spec:
+  selector:
     matchLabels:
-      app: eventbus
-  policyTypes:
-    - Ingress
-    - Egress
-  ingress:
-    - from: 
-      - ipBlock:
-          cidr: 0.0.0.0/0
-      ports:
-        - protocol: TCP
-          port: 4222
-        - protocol: TCP
-          port: 6222
-        - protocol: TCP
-          port: 8222
-  egress:
-    - to:
-      - ipBlock:
-          cidr: 0.0.0.0/0
-      ports:
-        - protocol: TCP
-          port: 4222
-        - protocol: TCP
-          port: 6222
-        - protocol: TCP
-          port: 8222
+      app: stan
+  serviceName: stan
+  replicas: 3
+  volumeClaimTemplates:
+  - metadata:
+      name: stan-sts-vol
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      volumeMode: "Filesystem"
+      resources:
+        requests:
+          storage: 1Gi
+  template:
+    metadata:
+      labels:
+        app: stan
+    spec:
+      # Prevent NATS Streaming pods running in same host.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: "kubernetes.io/hostname"
+            labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - stan
+      # STAN Server
+      containers:
+      - name: stan
+        image: nats-streaming:latest
+        ports:
+        - containerPort: 8222
+          name: monitor
+        - containerPort: 7777
+          name: metrics
+        args:
+         - "-sc"
+         - "/etc/stan-config/stan.conf"
+
+        # Required to be able to define an environment variable
+        # that refers to other environment variables.  This env var
+        # is later used as part of the configuration file.
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: CLUSTER_ADVERTISE
+          value: $(POD_NAME).nats.$(POD_NAMESPACE).svc
+        - name: CLUSTER_ROUTES
+          value: "[ stan://stan-0.stan.$(POD_NAMESPACE).svc:6222, stan://stan-1.stan.$(POD_NAMESPACE).svc:6222, stan://stan-2.stan.$(POD_NAMESPACE).svc:6222 ]"
+        volumeMounts:
+          - name: config-volume
+            mountPath: /etc/stan-config
+          - name: stan-sts-vol
+            mountPath: /data/stan
+
+        # Disable CPU limits.
+        resources:
+          requests:
+            cpu: 0
+
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8222
+          initialDelaySeconds: 10
+          timeoutSeconds: 5
+      volumes:
+      - name: config-volume
+        configMap:
+          name: stan-config
